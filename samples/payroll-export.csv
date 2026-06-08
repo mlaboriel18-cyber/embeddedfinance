@@ -1,0 +1,21 @@
+# employees
+employee_id,first_name,last_name,role,hourly_rate,tip_eligible
+E101,Ashley,Parker,Server,10.65,true
+E102,Devon,Brown,Server,10.65,true
+E103,Luis,Garcia,Bartender,12.00,true
+E104,Taylor,King,Host,16.00,false
+
+# shifts
+employee_id,shift_date,hours_worked,shift_id
+E101,2026-05-18,8.5,S101
+E101,2026-05-19,9.0,S102
+E101,2026-05-20,10.0,S103
+E102,2026-05-18,6.0,S107
+E103,2026-05-18,8.0,S110
+
+# pos_sales
+employee_id,net_sales,credit_card_tips,cash_tips,transaction_id
+E101,1350,220,40,T101
+E101,1420,250,35,T102
+E102,950,80,90,T104
+E103,1800,320,70,T106

@@ -13,8 +13,8 @@
           <p class="eyebrow">Embedded Finance Multi-Agent Swarm</p>
           <h1>Payroll & Tip Compliance Console</h1>
           <p class="lede">
-            Run POS payroll data through the Comptroller and Devil's Advocate
-            audit before posting a final payroll payload.
+            Run messy POS exports through the Data Ingestion Agent, Anomaly &
+            Fraud Review, Comptroller, and Devil's Advocate before posting payroll.
           </p>
         </div>
         <div class="status-card">
@@ -26,31 +26,59 @@
         </div>
       </section>
 
-      <section class="scenario-panel">
+      <section class="scenario-panel upload-panel">
         <div class="section-heading">
           <div>
-            <h2>Scenario Input</h2>
-            <span>Paste POS payroll JSON for the agents to assess</span>
+            <h2>Upload POS Export</h2>
+            <span>All payroll data enters through file upload</span>
           </div>
           <div class="button-row">
-            <button id="loadSampleButton" class="secondary-button" type="button">Load Sample</button>
-            <button id="validateScenarioButton" type="button">Validate Scenario</button>
+            <button id="loadSampleFileButton" class="secondary-button" type="button">Load Sample File</button>
+            <button id="validateScenarioButton" type="button">Run Full Audit</button>
           </div>
         </div>
         <p class="helper-text">
-          Required keys: <code>employees</code>, <code>shifts</code>, and
-          <code>pos_sales</code>. Optional: <code>payroll_rules</code> with
-          <code>tip_out_rates</code>, <code>weekly_regular_hour_cap</code>,
-          <code>overtime_multiplier</code>, and <code>local_minimum_wage</code>.
-          The input also accepts TypeScript-style <code>export const</code>
-          declarations.
+          Upload Toast/Square CSV or Excel exports, tab-delimited labor reports,
+          JSON payroll dumps, or JavaScript <code>export const</code> files. Drop
+          one file or many — every sheet/section is read and merged.
         </p>
-        <textarea
-          id="scenarioInput"
-          spellcheck="false"
-          aria-label="Payroll scenario JSON input"
-        ></textarea>
-        <p id="scenarioStatus" class="scenario-status">Sample scenario loaded.</p>
+        <label class="upload-dropzone" id="uploadDropzone" for="payrollFileInput">
+          <input
+            id="payrollFileInput"
+            type="file"
+            accept=".csv,.tsv,.txt,.json,.js,.xlsx,.xls,.xlsm"
+            multiple
+            hidden
+          />
+          <strong>Drop files here or click to browse</strong>
+          <span>Accepted: .csv, .tsv, .xlsx, .xls, .txt, .json, .js · multiple files OK</span>
+        </label>
+        <p id="uploadedFileMeta" class="upload-meta">No file uploaded yet.</p>
+        <p id="scenarioStatus" class="scenario-status">Upload a POS export file to begin.</p>
+      </section>
+
+      <section class="agent-grid">
+        <article class="panel-card agent-card">
+          <div class="agent-heading">
+            <h2>Data Ingestion Agent</h2>
+            <span id="ingestionStatus" class="agent-badge">Idle</span>
+          </div>
+          <p id="ingestionSummary" class="agent-summary">
+            Normalizes messy POS exports into employees, shifts, and pos_sales.
+          </p>
+          <ul id="ingestionFlags" class="agent-list"></ul>
+        </article>
+
+        <article class="panel-card agent-card">
+          <div class="agent-heading">
+            <h2>Anomaly &amp; Fraud Review</h2>
+            <span id="anomalyStatus" class="agent-badge">Idle</span>
+          </div>
+          <p id="anomalySummary" class="agent-summary">
+            Ranks suspicious tip, hour, and sales patterns before payroll posting.
+          </p>
+          <ol id="anomalyQueue" class="agent-list ranked"></ol>
+        </article>
       </section>
 
       <section class="control-panel">
@@ -72,7 +100,10 @@
         </div>
 
         <div class="panel-card audit">
-          <h2>Devil's Advocate</h2>
+          <div class="agent-heading">
+            <h2>Devil's Advocate</h2>
+            <span id="devilsAdvocateStatus" class="agent-badge">Idle</span>
+          </div>
           <p id="auditChallenge">
             But what happens if the tip pool includes managers or back-of-house
             staff while tipped employees are paid below full minimum wage?
@@ -102,7 +133,7 @@
         </article>
       </section>
 
-      <section class="content-grid">
+      <section class="payroll-stack">
         <div class="table-card">
           <div class="section-heading">
             <h2>Employee Payroll</h2>
@@ -112,10 +143,11 @@
             <table>
               <thead>
                 <tr>
-                  <th>Employee</th>
+                  <th>Name</th>
+                  <th>Employee ID</th>
                   <th>Role</th>
                   <th>Hours</th>
-                  <th>Tip Received</th>
+                  <th>Tips Received</th>
                   <th>Top-Up</th>
                   <th>Gross Pay</th>
                   <th>Effective Rate</th>
@@ -137,6 +169,9 @@
       </section>
     </main>
 
-    <script src="./app.js?v=20260525-comment-import"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="./agents/data-ingestion-agent.js?v=20260604-allocation-flags"></script>
+    <script src="./agents/anomaly-fraud-agent.js?v=20260604-allocation-flags"></script>
+    <script src="./app.js?v=20260604-payroll-name-dedupe"></script>
   </body>
 </html>

@@ -66,7 +66,113 @@ const sampleScenario = {
   payroll_rules: payrollRules
 };
 
-let activeScenario = JSON.parse(JSON.stringify(sampleScenario));
+let activeScenario = null;
+let uploadedSources = [];
+
+function isExcelFile(file) {
+  const name = file.name.toLowerCase();
+  return name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".xlsm");
+}
+
+
+function combineUploadedSources(sources) {
+  if (!sources.length) {
+    return { name: null, text: null, format: null, fileCount: 0, sectionCount: 0 };
+  }
+
+  if (sources.length === 1) {
+    const source = sources[0];
+    const sectionCount = (source.text.match(/^#{1,3}\s/mg) || []).length || 1;
+    return {
+      name: source.name,
+      text: source.text,
+      format: source.format,
+      fileCount: 1,
+      sectionCount
+    };
+  }
+
+  const combinedText = sources
+    .map((source) => {
+      const sections = source.text.split(/\n\n(?=#)/);
+      return sections
+        .map((section) => {
+          const trimmed = section.trim();
+          if (!trimmed) {
+            return "";
+          }
+          if (trimmed.startsWith("#")) {
+            return trimmed.replace(/^#\s*/, `# ${source.name} :: `);
+          }
+          return `# ${source.name}\n${trimmed}`;
+        })
+        .filter(Boolean)
+        .join("\n\n");
+    })
+    .filter(Boolean)
+    .join("\n\n\n");
+
+  const sectionCount = (combinedText.match(/^#{1,3}\s/mg) || []).length || sources.length;
+  const totalSheets = sources.reduce((sum, source) => sum + (source.sheetCount || 0), 0);
+  const excelSources = sources.filter((source) => source.format?.startsWith("excel"));
+
+  return {
+    name: `${sources.length} files (${sources.map((source) => source.name).join(", ")})`,
+    text: combinedText,
+    format: excelSources.length
+      ? `batch (${sources.length} files, ${totalSheets || sectionCount} section${(totalSheets || sectionCount) === 1 ? "" : "s"})`
+      : `batch (${sources.length} files, ${sectionCount} section${sectionCount === 1 ? "" : "s"})`,
+    fileCount: sources.length,
+    sectionCount
+  };
+}
+
+async function readUploadedFiles(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) {
+    return [];
+  }
+
+  const sources = [];
+  for (const file of files) {
+    if (!isExcelFile(file)) {
+      sources.push({
+        name: file.name,
+        text: await file.text(),
+        format: null,
+        sheetCount: 0
+      });
+      continue;
+    }
+
+    if (typeof XLSX === "undefined") {
+      throw new Error("Excel parser failed to load. Refresh the page and try again.");
+    }
+
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: true });
+    if (!workbook.SheetNames.length) {
+      throw new Error(`${file.name} contains no worksheets.`);
+    }
+
+    const sections = workbook.SheetNames.map((sheetName) => {
+      const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[sheetName], { blankrows: false }).trim();
+      return csv ? `# ${file.name} :: ${sheetName}\n${csv}` : "";
+    }).filter(Boolean);
+
+    if (!sections.length) {
+      throw new Error(`${file.name} worksheets are empty.`);
+    }
+
+    sources.push({
+      name: file.name,
+      text: sections.join("\n\n"),
+      format: `excel (${workbook.SheetNames.length} sheet${workbook.SheetNames.length === 1 ? "" : "s"})`,
+      sheetCount: workbook.SheetNames.length
+    });
+  }
+
+  return sources;
+}
 
 const currency = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -74,6 +180,14 @@ const currency = new Intl.NumberFormat("en-US", {
 });
 
 const roundMoney = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 function sumByEmployee(records, valueKey) {
   return records.reduce((totals, record) => {
@@ -315,44 +429,709 @@ function normalizeScenario(rawScenario) {
 
 function validateScenario(scenario) {
   const errors = [];
-  const employeeIds = new Set(scenario.employees.map((employee) => employee.employee_id));
+
+  if (!scenario.employees.length && !scenario.shifts.length && !scenario.pos_sales.length) {
+    errors.push("No recognizable payroll data was found in the upload.");
+    return errors;
+  }
 
   if (!scenario.employees.length) {
-    errors.push("employees must contain at least one employee.");
+    errors.push(
+      `No employees could be resolved. Found ${scenario.shifts.length} shifts and ${scenario.pos_sales.length} sales rows — check for an Employee or Employee_id column.`
+    );
   }
 
-  if (!scenario.shifts.length) {
-    errors.push("shifts must contain at least one shift.");
+  if (!scenario.shifts.length && !scenario.pos_sales.length) {
+    errors.push(
+      `No shift hours or sales/tip rows found. Found ${scenario.employees.length} employees — include hours or sales data.`
+    );
   }
-
-  scenario.employees.forEach((employee, index) => {
-    if (!employee.employee_id) errors.push(`employees[${index}] is missing employee_id.`);
-    if (!employee.role) errors.push(`employees[${index}] is missing role.`);
-    if (!Number.isFinite(Number(employee.hourly_rate))) {
-      errors.push(`employees[${index}] is missing a numeric hourly_rate.`);
-    }
-  });
-
-  scenario.shifts.forEach((shift, index) => {
-    if (!employeeIds.has(shift.employee_id)) {
-      errors.push(`shifts[${index}] references unknown employee_id ${shift.employee_id || "(blank)"}.`);
-    }
-    if (!Number.isFinite(Number(shift.hours_worked))) {
-      errors.push(`shifts[${index}] is missing numeric hours_worked.`);
-    }
-  });
-
-  scenario.pos_sales.forEach((sale, index) => {
-    if (!employeeIds.has(sale.employee_id)) {
-      errors.push(`pos_sales[${index}] references unknown employee_id ${sale.employee_id || "(blank)"}.`);
-    }
-  });
 
   return errors;
 }
 
-function calculatePayroll({ minimumWage, splitMode }) {
+const REVIEW_FLAG_LABELS = {
+  TIP_ALLOCATION_MISMATCH: "Tip allocation mismatch",
+  TIP_ALLOCATION_CRITICAL: "Critical allocation gap",
+  TIP_ALLOCATION_ROW_MISMATCH: "Row allocation mismatch",
+  TIP_ALLOCATION_ROW_CRITICAL: "Critical row allocation gap",
+  MANUAL_TIP_ADJUSTMENT: "Manual tip adjustment",
+  MISSING_TIP_ALLOCATION: "Missing tip allocation",
+  OVERTIME_HOURS: "Overtime hours",
+  TIP_TOTAL_MISMATCH: "Tip total mismatch",
+  CASH_TIP_HEAVY: "Cash-heavy tips",
+  LOW_SALES_PER_HOUR: "Low sales/hour",
+  HIGH_SALES_PER_HOUR: "High sales/hour",
+  MISSING_TIPS_ON_TIPPED_ROLE: "Missing tips",
+  DUPLICATE_SHIFT_PATTERN: "Duplicate shift",
+  EXCESSIVE_SHIFT_LENGTH: "Excessive shift length",
+  CHECK_LEVEL_TIP_SPIKE: "Check-level tip spike",
+  DUPLICATE_EMPLOYEE_RECORD: "Duplicate employee record",
+  EMPLOYEE_ID_DERIVED_FROM_NAME: "Derived employee ID",
+  MISSING_HOURS: "Missing hours",
+  UNKNOWN_SHIFT_EMPLOYEE: "Unknown shift employee",
+  UNKNOWN_SALE_EMPLOYEE: "Unknown sale employee",
+  MINIMUM_WAGE_SHORTFALL: "Below minimum wage"
+};
+
+function summarizeEmployeeReviewReasons(row) {
+  const reasons = (row.review_flags || []).map((flag) => ({
+    code: flag.code,
+    source: flag.source,
+    severity: flag.severity || "review",
+    label: REVIEW_FLAG_LABELS[flag.code] || flag.code.replace(/_/g, " ").toLowerCase(),
+    message: flag.message,
+    likely_cause: flag.likely_cause || ""
+  }));
+
+  if (row.status === "requires_review" && row.minimum_wage_compliant === false) {
+    reasons.push({
+      code: "MINIMUM_WAGE_SHORTFALL",
+      source: "payroll",
+      severity: "blocking",
+      label: REVIEW_FLAG_LABELS.MINIMUM_WAGE_SHORTFALL,
+      message: `Effective rate ${currency.format(row.effective_hourly_rate)}/hr is below the configured minimum wage.`,
+      likely_cause: "Tip credit or allocation may leave this employee under minimum wage."
+    });
+  }
+
+  if (row.status === "no_shifts_in_period") {
+    reasons.push({
+      code: "NO_SHIFTS",
+      source: "payroll",
+      severity: "review",
+      label: "No shifts",
+      message: "No hours recorded in the pay period.",
+      likely_cause: "Missing timecard data or inactive employee."
+    });
+  }
+
+  const seen = new Set();
+  const unique = reasons.filter((reason) => {
+    const key = `${reason.code}|${reason.message}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+
+  const grouped = new Map();
+  unique.forEach((reason) => {
+    if (!grouped.has(reason.code)) {
+      grouped.set(reason.code, { ...reason, count: 1 });
+      return;
+    }
+
+    const existing = grouped.get(reason.code);
+    existing.count += 1;
+  });
+
+  return [...grouped.values()].map((reason) => ({
+    ...reason,
+    message:
+      reason.count > 1
+        ? `${reason.label} flagged across ${reason.count} records. ${reason.message}`
+        : reason.message
+  }));
+}
+
+function formatReviewReasonsCell(row) {
+  const reasons = row.review_reasons || [];
+
+  if (!reasons.length) {
+    return `<span class="muted-text">—</span>`;
+  }
+
+  return `<ul class="review-reason-list">${reasons
+    .map((reason) => {
+      const severityClass =
+        reason.severity === "critical" || reason.severity === "blocking"
+          ? "critical"
+          : reason.severity === "info"
+            ? "info"
+            : "review";
+      return `<li class="review-reason ${severityClass}">
+        <span class="reason-tag ${severityClass}">${escapeHtml(reason.label)}</span>
+        <span class="reason-detail">${escapeHtml(reason.message)}</span>
+      </li>`;
+    })
+    .join("")}</ul>`;
+}
+
+function payrollRowClass(row) {
+  if (row.status === "critical_review") {
+    return "payroll-row critical";
+  }
+  if (row.status === "requires_review" || row.status === "no_shifts_in_period") {
+    return "payroll-row review";
+  }
+  return "payroll-row compliant";
+}
+
+function sortPayrollRows(rows) {
+  const rank = {
+    critical_review: 0,
+    requires_review: 1,
+    no_shifts_in_period: 2,
+    compliant: 3
+  };
+
+  return rows.slice().sort((left, right) => {
+    const leftRank = rank[left.status] ?? 4;
+    const rightRank = rank[right.status] ?? 4;
+    if (leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+    return String(left.display_name || left.employee_id).localeCompare(
+      String(right.display_name || right.employee_id)
+    );
+  });
+}
+
+function buildEmployeesRequiringReview(employeePayroll) {
+  return employeePayroll
+    .filter(
+      (row) =>
+        row.status === "no_shifts_in_period" ||
+        isFraudVerdictBlocking(row.fraud_verdict) ||
+        row.fraud_verdict === "advisory"
+    )
+    .map((row) => ({
+      employee_id: row.employee_id,
+      name: row.display_name || row.name || "Name unavailable",
+      employee_label: row.employee_label || row.employee_id,
+      role: row.role,
+      status: row.status,
+      anomaly_findings: row.anomaly_findings || [],
+      reasons: (row.review_reasons || []).map((reason) => ({
+        code: reason.code,
+        label: reason.label,
+        severity: reason.severity,
+        message: reason.message,
+        likely_cause: reason.likely_cause || undefined
+      }))
+    }));
+}
+
+function buildEmployeeReviewFlags(ingestionAudit, anomalyAudit) {
+  const byEmployee = new Map();
+
+  function addFlag(employeeId, flag) {
+    if (!employeeId) {
+      return;
+    }
+
+    if (!byEmployee.has(employeeId)) {
+      byEmployee.set(employeeId, []);
+    }
+
+    const existing = byEmployee.get(employeeId);
+    const duplicate = existing.some(
+      (entry) => entry.source === flag.source && entry.code === flag.code && entry.message === flag.message
+    );
+    if (!duplicate) {
+      existing.push(flag);
+    }
+  }
+
+  (ingestionAudit?.flags || []).forEach((flag) => {
+    if (!flag.employee_id) {
+      return;
+    }
+
+    addFlag(flag.employee_id, {
+      source: "ingestion",
+      code: flag.code,
+      severity: flag.severity || "review",
+      message: flag.message
+    });
+  });
+
+  (anomalyAudit?.findings || []).forEach((finding) => {
+    const flag = {
+      source: "anomaly",
+      code: finding.code,
+      severity: finding.severity || "review",
+      message: finding.message,
+      likely_cause: finding.likely_cause,
+      employee_name: finding.employee_name,
+      employee_label: finding.employee_label
+    };
+
+    if (finding.employee_id) {
+      addFlag(finding.employee_id, flag);
+    }
+
+    (finding.employee_ids || []).forEach((employeeId) => addFlag(employeeId, flag));
+  });
+
+  return byEmployee;
+}
+
+function resolveEmployeePayrollStatus(minimumWageCompliant, reviewFlags) {
+  const hasCritical = reviewFlags.some((flag) => ["critical", "blocking"].includes(flag.severity));
+  const hasReview = reviewFlags.some((flag) =>
+    ["critical", "blocking", "review", "info"].includes(flag.severity)
+  );
+
+  if (hasCritical) {
+    return "critical_review";
+  }
+
+  if (!minimumWageCompliant || hasReview) {
+    return "requires_review";
+  }
+
+  return "compliant";
+}
+
+function formatEmployeeStatusPill(row) {
+  if (row.status === "no_shifts_in_period") {
+    return { className: "warn", text: "No shifts", title: "No hours recorded in the pay period." };
+  }
+
+  const flags = row.review_flags || [];
+  const title = flags.length
+    ? flags
+        .map((flag) => `${REVIEW_FLAG_LABELS[flag.code] || flag.code}: ${flag.message}`)
+        .join("\n")
+    : row.status === "requires_review"
+      ? "Minimum wage top-up applied or compliance review required."
+      : "No ingestion or anomaly flags for this employee.";
+
+  if (row.status === "critical_review") {
+    return { className: "block", text: flags.length ? `Critical (${flags.length})` : "Critical", title };
+  }
+
+  if (row.status === "requires_review") {
+    return { className: "warn", text: flags.length ? `Review (${flags.length})` : "Review", title };
+  }
+
+  return { className: "ok", text: "Compliant", title };
+}
+
+function looksLikeEmployeeId(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return true;
+  }
+  if (/^(E|AUTO-E)\d+$/i.test(text)) {
+    return true;
+  }
+  if (/^EMP-[A-Z0-9_]+$/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function buildEmployeeDirectory(scenario) {
+  const normalized = normalizeScenario(scenario);
+  const directory = new Map();
+
+  normalized.employees.forEach((employee) => {
+    directory.set(employee.employee_id, {
+      employee_id: employee.employee_id,
+      display_name: resolveEmployeeDisplayName(employee, normalized),
+      role: employee.role || ""
+    });
+  });
+
+  const noteActivityRecord = (record) => {
+    const employeeId = record.employee_id;
+    if (!employeeId || directory.has(employeeId)) {
+      return;
+    }
+
+    const displayName =
+      record.employee_name && !looksLikeEmployeeId(record.employee_name)
+        ? String(record.employee_name).trim()
+        : "";
+
+    directory.set(employeeId, {
+      employee_id: employeeId,
+      display_name: displayName,
+      role: record.role || ""
+    });
+  };
+
+  normalized.shifts.forEach(noteActivityRecord);
+  normalized.pos_sales.forEach(noteActivityRecord);
+
+  return directory;
+}
+
+function nameFromDerivedEmployeeId(employeeId) {
+  if (!/^EMP-/i.test(String(employeeId || ""))) {
+    return "";
+  }
+
+  return String(employeeId)
+    .replace(/^EMP-/i, "")
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function getEmployeeIdentity(employeeId, directory, reviewFlags = []) {
+  const entry = directory instanceof Map ? directory.get(employeeId) : null;
+  let displayName = entry?.display_name && !looksLikeEmployeeId(entry.display_name) ? entry.display_name : "";
+
+  if (!displayName) {
+    displayName = nameFromDerivedEmployeeId(employeeId);
+  }
+
+  if (!displayName) {
+    const derivedFlag = reviewFlags.find((flag) => flag.code === "EMPLOYEE_ID_DERIVED_FROM_NAME");
+    const match = derivedFlag?.message?.match(/employee name "([^"]+)"/i);
+    if (match?.[1]) {
+      displayName = match[1];
+    }
+  }
+
+  if (!displayName) {
+    const namedFlag = reviewFlags.find((flag) => flag.employee_name && !looksLikeEmployeeId(flag.employee_name));
+    displayName = namedFlag?.employee_name || "";
+  }
+
+  return {
+    employee_id: employeeId,
+    display_name: displayName,
+    role: entry?.role || "",
+    label: displayName ? `${displayName} · ${employeeId}` : employeeId
+  };
+}
+
+const FRAUD_VERDICT_RANK = {
+  critical_review_required: 4,
+  review_recommended: 3,
+  advisory: 2,
+  compliant: 1
+};
+
+function collectReviewFlags(employeeReviewFlags, employeeId, relatedIds = []) {
+  const merged = [];
+  const seen = new Set();
+
+  [employeeId, ...(relatedIds || [])].filter(Boolean).forEach((id) => {
+    (employeeReviewFlags.get(id) || []).forEach((flag) => {
+      const key = `${flag.code}|${flag.message}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      merged.push(flag);
+    });
+  });
+
+  return merged;
+}
+
+function normalizePayrollName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function preferCanonicalEmployeeId(left, right) {
+  const leftId = String(left || "").trim();
+  const rightId = String(right || "").trim();
+  if (!leftId) {
+    return rightId;
+  }
+  if (!rightId) {
+    return leftId;
+  }
+
+  const score = (employeeId) => {
+    if (/^E\d+$/i.test(employeeId)) {
+      return 3;
+    }
+    if (/^\d+$/.test(employeeId)) {
+      return 2;
+    }
+    if (/^EMP-/i.test(employeeId)) {
+      return 1;
+    }
+    return 2;
+  };
+
+  const leftScore = score(leftId);
+  const rightScore = score(rightId);
+  if (leftScore !== rightScore) {
+    return leftScore > rightScore ? leftId : rightId;
+  }
+
+  return leftId.localeCompare(rightId) <= 0 ? leftId : rightId;
+}
+
+function mergePayrollRows(rows) {
+  if (rows.length <= 1) {
+    return rows[0];
+  }
+
+  const canonicalId = rows.reduce(
+    (best, row) => preferCanonicalEmployeeId(best, row.employee_id),
+    rows[0].employee_id
+  );
+  const primary = rows.find((row) => row.employee_id === canonicalId) || rows[0];
+  const relatedIds = [
+    ...new Set(
+      rows.flatMap((row) => [row.employee_id, ...(row.related_employee_ids || [])]).filter((id) => id !== canonicalId)
+    )
+  ].sort();
+
+  const merged = {
+    ...primary,
+    employee_id: canonicalId,
+    related_employee_ids: relatedIds,
+    review_flags: [],
+    anomaly_findings: [],
+    review_reasons: []
+  };
+
+  const sumFields = [
+    "hours",
+    "regular_pay",
+    "overtime_pay",
+    "reported_tips",
+    "source_tip_out",
+    "tip_out_received",
+    "net_tips",
+    "minimum_wage_top_up",
+    "gross_pay",
+    "employer_cash_disbursement"
+  ];
+
+  rows.forEach((row) => {
+    sumFields.forEach((field) => {
+      merged[field] = roundMoney((merged[field] || 0) + (row[field] || 0));
+    });
+    merged.review_flags.push(...(row.review_flags || []));
+    merged.anomaly_findings.push(...(row.anomaly_findings || []));
+  });
+
+  if (merged.hours > 0) {
+    merged.effective_hourly_rate = roundMoney(merged.gross_pay / merged.hours);
+    merged.minimum_wage_compliant = merged.effective_hourly_rate >= (primary.minimum_wage_used || merged.effective_hourly_rate);
+  }
+
+  let worstVerdict = rows[0];
+  rows.forEach((row) => {
+    if ((FRAUD_VERDICT_RANK[row.fraud_verdict] || 0) > (FRAUD_VERDICT_RANK[worstVerdict.fraud_verdict] || 0)) {
+      worstVerdict = row;
+    }
+  });
+  merged.fraud_verdict = worstVerdict.fraud_verdict;
+  merged.fraud_status_label = worstVerdict.fraud_status_label;
+  merged.fraud_status_class = worstVerdict.fraud_status_class;
+  merged.fraud_status_summary = worstVerdict.fraud_status_summary;
+  merged.review_reasons = summarizeEmployeeReviewReasons(merged);
+
+  return merged;
+}
+
+function consolidatePayrollRows(rows) {
+  const groups = new Map();
+
+  rows.forEach((row) => {
+    const nameKey =
+      row.display_name && !looksLikeEmployeeId(row.display_name)
+        ? normalizePayrollName(row.display_name)
+        : `id:${row.employee_id}`;
+    if (!groups.has(nameKey)) {
+      groups.set(nameKey, []);
+    }
+    groups.get(nameKey).push(row);
+  });
+
+  return [...groups.values()].map((group) => (group.length === 1 ? group[0] : mergePayrollRows(group)));
+}
+
+function getFraudVerdictForEmployee(anomalyAudit, employeeId, relatedIds = []) {
+  const ids = [employeeId, ...(relatedIds || [])].filter(Boolean);
+  let best = null;
+
+  ids.forEach((id) => {
+    const verdict = anomalyAudit?.employee_verdicts?.[id];
+    if (!verdict) {
+      return;
+    }
+    if (!best || (FRAUD_VERDICT_RANK[verdict.verdict] || 0) > (FRAUD_VERDICT_RANK[best.verdict] || 0)) {
+      best = verdict;
+    }
+  });
+
+  if (best) {
+    return best;
+  }
+
+  return {
+    employee_id: employeeId,
+    verdict: "compliant",
+    label: "Compliant",
+    status_class: "ok",
+    finding_count: 0,
+    findings: [],
+    summary: "No anomaly or fraud findings for this employee."
+  };
+}
+
+function buildAnomalyFindingsByEmployee(anomalyAudit) {
+  return anomalyAudit?.findings_by_employee || {};
+}
+
+function resolveEmployeeDisplayName(employee, scenario) {
+  const fromRecord = `${employee.first_name || ""} ${employee.last_name || ""}`.trim();
+  if (fromRecord && !looksLikeEmployeeId(fromRecord)) {
+    return fromRecord;
+  }
+
+  const candidates = [];
+  scenario.shifts.forEach((shift) => {
+    if (shift.employee_id === employee.employee_id && shift.employee_name) {
+      candidates.push(String(shift.employee_name).trim());
+    }
+  });
+  scenario.pos_sales.forEach((sale) => {
+    if (sale.employee_id === employee.employee_id && sale.employee_name) {
+      candidates.push(String(sale.employee_name).trim());
+    }
+  });
+
+  const validNames = candidates.filter((name) => name && !looksLikeEmployeeId(name));
+  if (validNames.length) {
+    return validNames.sort((left, right) => right.length - left.length)[0];
+  }
+
+  return nameFromDerivedEmployeeId(employee.employee_id);
+}
+
+function formatPayrollEmployeeName(row) {
+  const name = (row.display_name || row.name || nameFromDerivedEmployeeId(row.employee_id) || "").trim();
+  if (name && !looksLikeEmployeeId(name)) {
+    return escapeHtml(name);
+  }
+  return `<span class="muted-text">Name unavailable</span>`;
+}
+
+function formatPayrollEmployeeId(row) {
+  return escapeHtml(row.employee_id);
+}
+
+function isFraudVerdictBlocking(verdict) {
+  return verdict === "review_recommended" || verdict === "critical_review_required";
+}
+
+function buildDevilsAdvocateAudit({
+  canPostPayroll,
+  complianceFlags,
+  anomalyAudit,
+  employeePayroll,
+  splitMode,
+  ingestionAudit
+}) {
+  const challenges = [];
+  const resolutions = [];
+  const fraudFlagged = employeePayroll.filter((row) => isFraudVerdictBlocking(row.fraud_verdict));
+  const criticalFraud = employeePayroll.filter((row) => row.fraud_verdict === "critical_review_required");
+  const blockingCompliance = complianceFlags.filter((flag) => flag.severity === "blocking");
+  const reviewCompliance = complianceFlags.filter((flag) => flag.severity === "review");
+
+  blockingCompliance.forEach((flag) => {
+    challenges.push(flag.message);
+  });
+
+  reviewCompliance.forEach((flag) => {
+    challenges.push(flag.message);
+  });
+
+  if (anomalyAudit?.status === "critical_review_required") {
+    challenges.push(
+      `Anomaly & Fraud Review found ${anomalyAudit.summary?.critical || 0} critical finding(s) requiring investigation before payroll posting.`
+    );
+  } else if (anomalyAudit?.status === "review_recommended") {
+    challenges.push(
+      `Anomaly & Fraud Review recommended review for ${anomalyAudit.summary?.employees_flagged || fraudFlagged.length} employee(s).`
+    );
+  }
+
+  if (fraudFlagged.length) {
+    const ids = fraudFlagged.map((row) => row.employee_id).join(", ");
+    challenges.push(`Flagged employees: ${ids}.`);
+  }
+
+  if (ingestionAudit?.flags?.some((flag) => flag.severity === "blocking")) {
+    challenges.push("Data ingestion reported blocking issues that weaken payroll defensibility.");
+  }
+
+  if (!challenges.length) {
+    challenges.push(
+      splitMode === "allActive"
+        ? "But what happens if all active staff share the tip pool while tipped employees remain below full minimum wage?"
+        : "But what happens if managers or back-of-house workers share the tip pool while tipped employees rely on tip credit?"
+    );
+  }
+
+  if (canPostPayroll) {
+    resolutions.push(
+      "Devil's Advocate clearance: Connecticut minimum wage top-ups are applied, the selected tip-out mode is internally consistent, and Anomaly & Fraud Review returned no blocking employee verdicts."
+    );
+  } else if (criticalFraud.length) {
+    resolutions.push(
+      `Do not post payroll until critical fraud/anomaly findings are cleared for ${criticalFraud.map((row) => row.employee_id).join(", ")}.`
+    );
+  } else if (fraudFlagged.length) {
+    resolutions.push(
+      `Resolve Anomaly & Fraud Review findings for ${fraudFlagged.map((row) => row.employee_id).join(", ")} before posting payroll.`
+    );
+  } else if (blockingCompliance.length) {
+    resolutions.push(blockingCompliance[0].message);
+  } else {
+    resolutions.push(
+      "Adjust the tip-out allocation mode or confirm a compliant wage policy before posting this payroll payload."
+    );
+  }
+
+  let status = "approved";
+  if (blockingCompliance.length || criticalFraud.length || anomalyAudit?.status === "critical_review_required") {
+    status = "blocked";
+  } else if (!canPostPayroll || fraudFlagged.length || anomalyAudit?.status === "review_recommended") {
+    status = "review";
+  }
+
+  return {
+    agent: "devils_advocate",
+    status,
+    challenge: challenges.join(" "),
+    resolution: resolutions.join(" "),
+    fraud_flagged_count: fraudFlagged.length,
+    can_post_payroll: canPostPayroll
+  };
+}
+
+function renderDevilsAdvocateAudit(audit) {
+  const badgeType =
+    audit.status === "approved"
+      ? "ok"
+      : audit.status === "review"
+        ? "warn"
+        : audit.status === "idle"
+          ? "ok"
+          : "block";
+
+  setAgentBadge("#devilsAdvocateStatus", audit.status, badgeType);
+  document.querySelector("#auditChallenge").textContent = audit.challenge;
+  document.querySelector("#auditResolution").textContent = audit.resolution;
+}
+
+function calculatePayroll({ minimumWage, splitMode, ingestionAudit, anomalyAudit, employeeDirectory }) {
   const scenario = normalizeScenario(activeScenario);
+  const directory = employeeDirectory || buildEmployeeDirectory(scenario);
+  const anomalyFindingsByEmployee = buildAnomalyFindingsByEmployee(anomalyAudit);
   const scenarioEmployees = scenario.employees;
   const scenarioRules = scenario.payroll_rules;
   const hoursByEmployee = sumByEmployee(scenario.shifts, "hours_worked");
@@ -374,6 +1153,7 @@ function calculatePayroll({ minimumWage, splitMode }) {
     ? splitCentsEvenly(totalTipOutPool, recipients)
     : {};
 
+  const employeeReviewFlags = buildEmployeeReviewFlags(ingestionAudit, anomalyAudit);
   const complianceFlags = [];
   const tipCreditInUse = scenarioEmployees.some((employee) => {
     const hours = hoursByEmployee[employee.employee_id] || 0;
@@ -409,17 +1189,35 @@ function calculatePayroll({ minimumWage, splitMode }) {
     });
   }
 
-  const employeePayroll = scenarioEmployees.map((employee) => {
+  const employeePayroll = consolidatePayrollRows(
+    scenarioEmployees.map((employee) => {
+    const relatedIds = employee.related_employee_ids || [];
     const hours = roundMoney(hoursByEmployee[employee.employee_id] || 0);
 
     if (hours === 0) {
-      return {
+      const reviewFlags = collectReviewFlags(employeeReviewFlags, employee.employee_id, relatedIds);
+      const identity = getEmployeeIdentity(employee.employee_id, directory, reviewFlags);
+      const fraudVerdict = getFraudVerdictForEmployee(anomalyAudit, employee.employee_id, relatedIds);
+      const payrollRow = {
         employee_id: employee.employee_id,
-        name: `${employee.first_name} ${employee.last_name}`,
+        related_employee_ids: relatedIds,
+        name: identity.display_name,
+        display_name: identity.display_name,
+        employee_label: identity.label,
         role: employee.role,
         hours: 0,
-        status: "no_shifts_in_period"
+        anomaly_findings: relatedIds
+          .flatMap((id) => anomalyFindingsByEmployee[id] || [])
+          .concat(anomalyFindingsByEmployee[employee.employee_id] || []),
+        fraud_verdict: fraudVerdict.verdict,
+        fraud_status_label: fraudVerdict.label,
+        fraud_status_class: fraudVerdict.status_class,
+        fraud_status_summary: fraudVerdict.summary,
+        status: "no_shifts_in_period",
+        review_flags: reviewFlags
       };
+      payrollRow.review_reasons = summarizeEmployeeReviewReasons(payrollRow);
+      return payrollRow;
     }
 
     const regularHours = Math.min(hours, scenarioRules.weekly_regular_hour_cap);
@@ -443,9 +1241,19 @@ function calculatePayroll({ minimumWage, splitMode }) {
     const cashTipsReported = roundMoney(cashTipsByEmployee[employee.employee_id] || 0);
     const employerCashDisbursement = roundMoney(grossPay - cashTipsReported);
 
-    return {
+    const reviewFlags = collectReviewFlags(employeeReviewFlags, employee.employee_id, relatedIds);
+    const identity = getEmployeeIdentity(employee.employee_id, directory, reviewFlags);
+    const fraudVerdict = getFraudVerdictForEmployee(anomalyAudit, employee.employee_id, relatedIds);
+    const payrollStatus = resolveEmployeePayrollStatus(
+      effectiveHourlyRate >= minimumWage,
+      reviewFlags
+    );
+    const payrollRow = {
       employee_id: employee.employee_id,
-      name: `${employee.first_name} ${employee.last_name}`,
+      related_employee_ids: relatedIds,
+      name: identity.display_name,
+      display_name: identity.display_name,
+      employee_label: identity.label,
       role: employee.role,
       hours,
       regular_pay: regularPay,
@@ -458,10 +1266,22 @@ function calculatePayroll({ minimumWage, splitMode }) {
       gross_pay: grossPay,
       effective_hourly_rate: effectiveHourlyRate,
       minimum_wage_compliant: effectiveHourlyRate >= minimumWage,
+      minimum_wage_used: minimumWage,
       employer_cash_disbursement: employerCashDisbursement,
-      status: effectiveHourlyRate >= minimumWage ? "compliant" : "requires_review"
+      review_flags: reviewFlags,
+      anomaly_findings: relatedIds
+        .flatMap((id) => anomalyFindingsByEmployee[id] || [])
+        .concat(anomalyFindingsByEmployee[employee.employee_id] || []),
+      fraud_verdict: fraudVerdict.verdict,
+      fraud_status_label: fraudVerdict.label,
+      fraud_status_class: fraudVerdict.status_class,
+      fraud_status_summary: fraudVerdict.summary,
+      status: payrollStatus
     };
-  });
+    payrollRow.review_reasons = summarizeEmployeeReviewReasons(payrollRow);
+    return payrollRow;
+  })
+  );
 
   const totals = employeePayroll.reduce(
     (accumulator, row) => {
@@ -500,9 +1320,26 @@ function calculatePayroll({ minimumWage, splitMode }) {
     }
   );
 
+  const flaggedEmployees = employeePayroll.filter((row) => isFraudVerdictBlocking(row.fraud_verdict)).length;
+
   const canPostPayroll =
     complianceFlags.every((flag) => flag.severity !== "blocking") &&
-    employeePayroll.every((row) => row.status === "no_shifts_in_period" || row.minimum_wage_compliant);
+    employeePayroll.every(
+      (row) => row.status === "no_shifts_in_period" || !isFraudVerdictBlocking(row.fraud_verdict)
+    ) &&
+    employeePayroll.every(
+      (row) => row.status === "no_shifts_in_period" || row.minimum_wage_compliant
+    );
+
+  const employeesRequiringReview = buildEmployeesRequiringReview(employeePayroll);
+  const devilsAdvocateAudit = buildDevilsAdvocateAudit({
+    canPostPayroll,
+    complianceFlags,
+    anomalyAudit,
+    employeePayroll,
+    splitMode,
+    ingestionAudit
+  });
 
   return {
     workflow: "payroll_tip_calculation",
@@ -510,6 +1347,8 @@ function calculatePayroll({ minimumWage, splitMode }) {
     scenario_name: scenario.scenario_name,
     status: canPostPayroll ? "approved_with_adjustments" : "blocked_for_review",
     can_post_payroll: canPostPayroll,
+    flagged_employee_count: flaggedEmployees,
+    employees_requiring_review: employeesRequiringReview,
     minimum_wage: {
       jurisdiction: "Connecticut",
       effective_year: 2026,
@@ -520,24 +1359,36 @@ function calculatePayroll({ minimumWage, splitMode }) {
     tip_out_allocation: {
       total_tip_out_pool: totalTipOutPool,
       allocation_method: splitMode,
-      recipients: recipients.map((employee) => ({
-        employee_id: employee.employee_id,
-        name: `${employee.first_name} ${employee.last_name}`,
-        role: employee.role,
-        tip_out_received: tipOutReceivedByEmployee[employee.employee_id] || 0
-      }))
+      recipients: recipients.map((employee) => {
+        const identity = getEmployeeIdentity(employee.employee_id, directory);
+        return {
+          employee_id: employee.employee_id,
+          name: identity.display_name || identity.label,
+          employee_label: identity.label,
+          role: employee.role,
+          tip_out_received: tipOutReceivedByEmployee[employee.employee_id] || 0
+        };
+      })
     },
     employee_payroll: employeePayroll,
+    employee_directory: [...directory.values()],
     payroll_totals: totals,
     compliance_flags: complianceFlags,
-    devils_advocate_audit: {
-      challenge:
-        "But what happens if 'staff' includes managers or back-of-house workers while servers and bartenders are paid below full minimum wage? Legally, this creates tip-pool and tip-credit exposure.",
-      resolution: canPostPayroll
-        ? "The payroll payload excludes managers/back-of-house from the tip-out split, applies Connecticut minimum wage, and adds any required top-up."
-        : "The selected allocation mode creates a compliance risk. Switch to active tip-eligible staff or confirm a compliant no-tip-credit policy before posting."
-    }
+    devils_advocate_audit: devilsAdvocateAudit
   };
+}
+
+function formatPayrollName(row) {
+  const name = row.display_name || row.name || "";
+  return name && !looksLikeEmployeeId(name) ? escapeHtml(name) : "—";
+}
+
+function formatPayrollEmployeeId(row) {
+  const related = row.related_employee_ids || [];
+  const allIds = [row.employee_id, ...related].filter(Boolean);
+  const title = related.length ? `Merged IDs: ${allIds.join(", ")}` : row.employee_id;
+  const suffix = related.length ? ` <small class="merged-id-note">(+${related.length})</small>` : "";
+  return `<span title="${escapeHtml(title)}">${escapeHtml(row.employee_id)}</span>${suffix}`;
 }
 
 function renderPayroll(payload) {
@@ -557,46 +1408,342 @@ function renderPayroll(payload) {
     payload.devils_advocate_audit.challenge;
   document.querySelector("#auditResolution").textContent =
     payload.devils_advocate_audit.resolution;
+  renderDevilsAdvocateAudit(payload.devils_advocate_audit);
   document.querySelector("#employeeCount").textContent =
     `${payload.employee_payroll.length} employees`;
 
   const rows = payload.employee_payroll
     .map((row) => {
       if (row.status === "no_shifts_in_period") {
+        const statusClass = row.fraud_status_class || "ok";
+        const statusText = row.fraud_status_label || "Compliant";
         return `
           <tr>
-            <td>${row.name}</td>
-            <td>${row.role}</td>
+            <td>${formatPayrollName(row)}</td>
+            <td>${formatPayrollEmployeeId(row)}</td>
+            <td>${escapeHtml(row.role)}</td>
             <td>0.0</td>
             <td>${currency.format(0)}</td>
             <td>${currency.format(0)}</td>
             <td>${currency.format(0)}</td>
             <td>--</td>
-            <td><span class="pill warn">No shifts</span></td>
+            <td><span class="pill ${statusClass}" title="${escapeHtml(row.fraud_status_summary || "")}">${statusText}</span></td>
           </tr>
         `;
       }
 
-      const statusClass = row.minimum_wage_compliant ? "ok" : "block";
-      const statusText = row.minimum_wage_compliant ? "Compliant" : "Review";
+      const statusClass = row.fraud_status_class || "ok";
+      const statusText = row.fraud_status_label || "Compliant";
 
       return `
         <tr>
-          <td>${row.name}</td>
-          <td>${row.role}</td>
+          <td>${formatPayrollName(row)}</td>
+          <td>${formatPayrollEmployeeId(row)}</td>
+          <td>${escapeHtml(row.role)}</td>
           <td>${row.hours.toFixed(1)}</td>
           <td>${currency.format(row.tip_out_received)}</td>
           <td>${currency.format(row.minimum_wage_top_up)}</td>
           <td>${currency.format(row.gross_pay)}</td>
           <td>${currency.format(row.effective_hourly_rate)}</td>
-          <td><span class="pill ${statusClass}">${statusText}</span></td>
+          <td><span class="pill ${statusClass}" title="${escapeHtml(row.fraud_status_summary || "")}">${statusText}</span></td>
         </tr>
       `;
     })
     .join("");
 
   document.querySelector("#payrollRows").innerHTML = rows;
-  document.querySelector("#jsonOutput").textContent = JSON.stringify(payload, null, 2);
+  const jsonOutput = document.querySelector("#jsonOutput");
+  const payrollCount = payload.employee_payroll.length;
+  if (payrollCount > 250) {
+    jsonOutput.textContent = JSON.stringify(
+      {
+        status: payload.status,
+        can_post_payroll: payload.can_post_payroll,
+        source_files: payload.data_ingestion_audit?.source_files || [],
+        summary: {
+          employees: payrollCount,
+          shifts: payload.data_ingestion_audit?.summary?.shifts,
+          pos_sales: payload.data_ingestion_audit?.summary?.pos_sales,
+          sections: payload.data_ingestion_audit?.summary?.sections,
+          ingestion_flags: payload.data_ingestion_audit?.summary?.flag_count,
+          anomaly_findings: payload.anomaly_fraud_audit?.summary?.total_findings
+        },
+        payroll_totals: payload.payroll_totals,
+        note: `Full payroll computed for ${payrollCount} employees. Download via Copy JSON uses this summary to keep the page responsive; all rows are rendered in the table above.`
+      },
+      null,
+      2
+    );
+  } else {
+    jsonOutput.textContent = JSON.stringify(payload, null, 2);
+  }
+}
+
+function renderPayrollReviewSummary(employeesRequiringReview) {
+  const banner = document.querySelector("#payrollReviewSummary");
+
+  if (!employeesRequiringReview.length) {
+    banner.className = "payroll-review-summary clear";
+    banner.innerHTML =
+      "<strong>All clear.</strong> No employees require review based on ingestion, anomaly, or payroll checks.";
+    return;
+  }
+
+  banner.className = "payroll-review-summary flagged";
+  banner.innerHTML = `
+    <div class="payroll-review-summary-heading">
+      <strong>${employeesRequiringReview.length} employee${employeesRequiringReview.length === 1 ? "" : "s"} require review</strong>
+      <span>Flagged rows are highlighted below with specific reasons.</span>
+    </div>
+    <ul class="payroll-review-summary-list">
+      ${employeesRequiringReview
+        .map((employee) => {
+          const reasons = employee.reasons
+            .map(
+              (reason) =>
+                `<li><span class="reason-tag ${reason.severity === "critical" || reason.severity === "blocking" ? "critical" : "review"}">${escapeHtml(reason.label)}</span> ${escapeHtml(reason.message)}</li>`
+            )
+            .join("");
+          return `<li class="payroll-review-summary-item">
+            <div class="payroll-review-summary-employee">
+              <strong>${escapeHtml(employee.name)}</strong>
+              <small>${escapeHtml(employee.employee_id)}</small>
+              · ${escapeHtml(employee.role)}
+            </div>
+            <ul class="payroll-review-summary-reasons">${reasons}</ul>
+          </li>`;
+        })
+        .join("")}
+    </ul>
+  `;
+}
+
+function parseStructuredScenario(text) {
+  const parsedScenario = parseScenarioText(text);
+  return normalizeScenario(parsedScenario);
+}
+
+function setUploadedSources(sources) {
+  uploadedSources = sources;
+  const combined = combineUploadedSources(sources);
+
+  if (!combined.text) {
+    document.querySelector("#uploadedFileMeta").textContent = "No files uploaded yet.";
+    return combined;
+  }
+
+  const formatLabel = combined.format ? ` · ${combined.format}` : "";
+  document.querySelector("#uploadedFileMeta").textContent =
+    sources.length === 1
+      ? `Loaded: ${combined.name}${formatLabel}`
+      : `Loaded ${sources.length} files (${combined.sectionCount} sections)${formatLabel}: ${sources.map((source) => source.name).join(", ")}`;
+
+  return combined;
+}
+
+async function loadSampleFile() {
+  const response = await fetch("./samples/payroll-export.csv");
+  if (!response.ok) {
+    setScenarioStatus("Could not load sample file.", "error");
+    return;
+  }
+  const text = await response.text();
+  setUploadedSources([{ name: "samples/payroll-export.csv", text, format: null, sheetCount: 0 }]);
+  setScenarioStatus("Sample file loaded.", "ok");
+  runPayrollAudit();
+}
+
+async function handleUploadedFiles(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) {
+    return;
+  }
+
+  try {
+    const sources = await readUploadedFiles(files);
+    setUploadedSources(sources);
+    setScenarioStatus(`Uploaded ${files.length} file${files.length === 1 ? "" : "s"}.`, "ok");
+    runPayrollAudit();
+  } catch (error) {
+    uploadedSources = [];
+    document.querySelector("#uploadedFileMeta").textContent = "Upload failed.";
+    setScenarioStatus(`Upload failed: ${error.message}`, "error");
+  }
+}
+
+function setAgentBadge(elementId, statusText, type = "ok") {
+  const badge = document.querySelector(elementId);
+  badge.textContent = statusText;
+  badge.className = `agent-badge ${type}`;
+}
+
+function renderIngestionAudit(ingestionAudit) {
+  setAgentBadge(
+    "#ingestionStatus",
+    ingestionAudit.status,
+    ingestionAudit.status === "success" || ingestionAudit.status === "idle"
+      ? "ok"
+      : ingestionAudit.status === "partial"
+        ? "warn"
+        : "block"
+  );
+
+  document.querySelector("#ingestionSummary").textContent = ingestionAudit.scenario
+    ? `${(() => {
+        const combined = combineUploadedSources(uploadedSources);
+        const sourceLabel = combined.name
+          ? `${combined.name}${combined.format ? ` (${combined.format})` : ""}: `
+          : "";
+        const sectionLabel = ingestionAudit.summary.sections
+          ? `${ingestionAudit.summary.sections} section${ingestionAudit.summary.sections === 1 ? "" : "s"}, `
+          : "";
+        return `${sourceLabel}Detected ${ingestionAudit.detected_format}. Read ${sectionLabel}${ingestionAudit.summary.employees} employees, ${ingestionAudit.summary.shifts} shifts, and ${ingestionAudit.summary.pos_sales} sales rows (${ingestionAudit.summary.flag_count} ingestion flags).`;
+      })()}`
+    : ingestionAudit.status === "idle"
+      ? "Waiting for a POS export file upload."
+      : ingestionAudit.flags[0]?.message || "Ingestion failed.";
+
+  const flags = ingestionAudit.flags;
+  const flagSummary =
+    flags.length > 25
+      ? `<li class="flag-summary-note"><strong>${flags.length} total flags</strong> — showing all below. Scroll to review.</li>`
+      : "";
+  document.querySelector("#ingestionFlags").innerHTML = flags.length
+    ? `${flagSummary}${flags
+        .map(
+          (flag) =>
+            `<li><strong>${flag.code}</strong> — ${flag.message}<small>${flag.severity.toUpperCase()}${flag.employee_id ? ` · ${flag.employee_id}` : ""}${flag.section ? ` · ${flag.section}` : ""}</small></li>`
+        )
+        .join("")}`
+    : "<li>No ingestion flags. Data shape looks usable.</li>";
+}
+
+function highlightPayrollEmployee(employeeId) {
+  document.querySelectorAll(".payroll-row-linked").forEach((row) => {
+    row.classList.remove("payroll-row-linked");
+  });
+
+  if (!employeeId) {
+    return;
+  }
+
+  const row = document.querySelector(`#payroll-row-${CSS.escape(employeeId)}`);
+  if (row) {
+    row.classList.add("payroll-row-linked");
+    row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+function renderAnomalyAudit(anomalyAudit) {
+  setAgentBadge(
+    "#anomalyStatus",
+    anomalyAudit.status,
+    anomalyAudit.status === "clear"
+      ? "ok"
+      : anomalyAudit.status === "review_recommended"
+        ? "warn"
+        : "block"
+  );
+
+  document.querySelector("#anomalySummary").textContent =
+    anomalyAudit.status === "skipped"
+      ? "Anomaly review skipped because ingestion did not produce a scenario."
+      : `${anomalyAudit.summary.total_findings} findings (${anomalyAudit.summary.critical} critical, ${anomalyAudit.summary.review} review) across ${anomalyAudit.summary.employees_flagged || 0} employees. Click a name to jump to payroll.`;
+
+  const queue = document.querySelector("#anomalyQueue");
+  queue.innerHTML = anomalyAudit.review_queue.length
+    ? anomalyAudit.review_queue
+        .map((finding) => {
+          const employeeChip = finding.employee_id
+            ? `<button type="button" class="employee-link" data-employee-id="${escapeHtml(finding.employee_id)}" title="View in Employee Payroll">
+                <span class="employee-link-name">${escapeHtml(finding.employee_name || "Name unavailable")}</span>
+                <span class="employee-link-id">${escapeHtml(finding.employee_id)}</span>
+              </button>`
+            : finding.employee_labels?.length
+              ? `<span class="employee-link-group">${finding.employee_labels
+                  .map((label) => `<span class="employee-link-static">${escapeHtml(label)}</span>`)
+                  .join("")}</span>`
+              : "";
+
+          return `<li class="anomaly-finding" data-employee-id="${escapeHtml(finding.employee_id || "")}">
+            <div class="finding-head">
+              <strong>#${finding.rank} ${finding.code}</strong>
+              ${employeeChip}
+            </div>
+            <div class="finding-message">${escapeHtml(finding.message)}</div>
+            <small>Priority ${finding.priority_score} · Likely cause: ${escapeHtml(finding.likely_cause || "Review required")}</small>
+          </li>`;
+        })
+        .join("")
+    : "<li>No anomalies ranked for review.</li>";
+
+  queue.querySelectorAll(".employee-link").forEach((button) => {
+    button.addEventListener("click", () => {
+      highlightPayrollEmployee(button.dataset.employeeId);
+    });
+  });
+}
+
+function ingestScenarioFromInput() {
+  const combined = combineUploadedSources(uploadedSources);
+  if (!combined.text) {
+    renderIngestionAudit({
+      agent: "data_ingestion",
+      status: "failed",
+      detected_format: "none",
+      flags: [{ code: "NO_FILE_UPLOADED", severity: "blocking", message: "Upload a POS export file to begin." }],
+      scenario: null
+    });
+    renderAnomalyAudit(AnomalyFraudAgent.analyze(null));
+    setScenarioStatus("Upload a POS export file to begin.", "error");
+    return null;
+  }
+
+  const ingestionAudit = DataIngestionAgent.ingest(combined.text, parseStructuredScenario);
+  ingestionAudit.source_file = combined.name;
+  ingestionAudit.source_files = uploadedSources.map((source) => source.name);
+
+  if (!ingestionAudit.scenario) {
+    renderIngestionAudit(ingestionAudit);
+    renderAnomalyAudit(AnomalyFraudAgent.analyze(null));
+    setScenarioStatus(`Scenario blocked: ${ingestionAudit.flags[0]?.message || "Ingestion failed."}`, "error");
+    return null;
+  }
+
+  const errors = validateScenario(ingestionAudit.scenario);
+  if (errors.length) {
+    ingestionAudit.flags.push({
+      code: "SCENARIO_VALIDATION_FAILED",
+      severity: "blocking",
+      message: errors[0]
+    });
+    ingestionAudit.status = "blocked";
+    renderIngestionAudit(ingestionAudit);
+    renderAnomalyAudit(AnomalyFraudAgent.analyze(null));
+    setScenarioStatus(`Scenario blocked: ${errors[0]}`, "error");
+    return null;
+  }
+
+  activeScenario = ingestionAudit.scenario;
+  renderIngestionAudit(ingestionAudit);
+
+  const employeeDirectory = buildEmployeeDirectory(activeScenario);
+  const anomalyAudit = AnomalyFraudAgent.analyze(activeScenario, { employeeDirectory });
+  renderAnomalyAudit(anomalyAudit);
+
+  const scenarioMinimumWage = Number(
+    activeScenario.payroll_rules?.local_minimum_wage ?? activeScenario.payroll_rules?.minimum_wage
+  );
+  if (Number.isFinite(scenarioMinimumWage) && scenarioMinimumWage > 0) {
+    document.querySelector("#minimumWageInput").value = scenarioMinimumWage.toFixed(2);
+  }
+
+  setScenarioStatus(
+    `${activeScenario.scenario_name} loaded: ${activeScenario.employees.length} employees, ${activeScenario.shifts.length} shifts, ${activeScenario.pos_sales.length} sales records.`,
+    ingestionAudit.status === "partial" ? "warn" : "ok"
+  );
+
+  return { ingestionAudit, anomalyAudit, employeeDirectory };
 }
 
 function setScenarioStatus(message, type = "ok") {
@@ -605,61 +1752,60 @@ function setScenarioStatus(message, type = "ok") {
   status.className = `scenario-status ${type}`;
 }
 
-function loadScenarioIntoEditor(scenario) {
-  document.querySelector("#scenarioInput").value = JSON.stringify(scenario, null, 2);
-}
-
-function readScenarioFromEditor() {
-  try {
-    const parsedScenario = parseScenarioText(document.querySelector("#scenarioInput").value);
-    const scenario = normalizeScenario(parsedScenario);
-    const errors = validateScenario(scenario);
-
-    if (errors.length) {
-      setScenarioStatus(`Scenario blocked: ${errors[0]}`, "error");
-      return null;
-    }
-
-    activeScenario = scenario;
-
-    const scenarioMinimumWage = Number(
-      scenario.payroll_rules.local_minimum_wage ?? scenario.payroll_rules.minimum_wage
-    );
-
-    if (Number.isFinite(scenarioMinimumWage) && scenarioMinimumWage > 0) {
-      document.querySelector("#minimumWageInput").value = scenarioMinimumWage.toFixed(2);
-    }
-
-    setScenarioStatus(
-      `${scenario.scenario_name} loaded: ${scenario.employees.length} employees, ${scenario.shifts.length} shifts, ${scenario.pos_sales.length} sales records.`,
-      "ok"
-    );
-    return scenario;
-  } catch (error) {
-    setScenarioStatus(`Scenario blocked: ${error.message}`, "error");
-    return null;
-  }
-}
-
 function runPayrollAudit() {
-  if (!readScenarioFromEditor()) {
+  const agentResults = ingestScenarioFromInput();
+  if (!agentResults) {
+    renderDevilsAdvocateAudit({
+      agent: "devils_advocate",
+      status: "blocked",
+      challenge: "Payroll audit stopped before Devil's Advocate review because ingestion did not produce a valid scenario.",
+      resolution: document.querySelector("#ingestionSummary").textContent
+    });
+    document.querySelector("#jsonOutput").textContent = JSON.stringify(
+      {
+        status: "blocked_at_ingestion",
+        data_ingestion_audit: document.querySelector("#ingestionSummary").textContent
+      },
+      null,
+      2
+    );
     return;
   }
 
   const minimumWage = Number(document.querySelector("#minimumWageInput").value);
   const splitMode = document.querySelector("#tipSplitMode").value;
-  const payload = calculatePayroll({ minimumWage, splitMode });
+  const payload = calculatePayroll({
+    minimumWage,
+    splitMode,
+    ingestionAudit: agentResults.ingestionAudit,
+    anomalyAudit: agentResults.anomalyAudit,
+    employeeDirectory: agentResults.employeeDirectory
+  });
+  payload.data_ingestion_audit = agentResults.ingestionAudit;
+  payload.anomaly_fraud_audit = agentResults.anomalyAudit;
   renderPayroll(payload);
 }
 
-document.querySelector("#loadSampleButton").addEventListener("click", () => {
-  activeScenario = JSON.parse(JSON.stringify(sampleScenario));
-  loadScenarioIntoEditor(activeScenario);
-  setScenarioStatus("Sample scenario loaded.", "ok");
-  runPayrollAudit();
+document.querySelector("#loadSampleFileButton").addEventListener("click", loadSampleFile);
+document.querySelector("#payrollFileInput").addEventListener("change", async (event) => {
+  await handleUploadedFiles(event.target.files);
 });
 document.querySelector("#validateScenarioButton").addEventListener("click", runPayrollAudit);
 document.querySelector("#runButton").addEventListener("click", runPayrollAudit);
+
+const uploadDropzone = document.querySelector("#uploadDropzone");
+uploadDropzone.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  uploadDropzone.classList.add("dragover");
+});
+uploadDropzone.addEventListener("dragleave", () => {
+  uploadDropzone.classList.remove("dragover");
+});
+uploadDropzone.addEventListener("drop", async (event) => {
+  event.preventDefault();
+  uploadDropzone.classList.remove("dragover");
+  await handleUploadedFiles(event.dataTransfer.files);
+});
 document.querySelector("#copyButton").addEventListener("click", async () => {
   const output = document.querySelector("#jsonOutput").textContent;
   await navigator.clipboard.writeText(output);
@@ -669,5 +1815,19 @@ document.querySelector("#copyButton").addEventListener("click", async () => {
   }, 1200);
 });
 
-loadScenarioIntoEditor(activeScenario);
-runPayrollAudit();
+renderIngestionAudit({
+  agent: "data_ingestion",
+  status: "idle",
+  detected_format: "none",
+  flags: [],
+  scenario: null
+});
+renderAnomalyAudit(AnomalyFraudAgent.analyze(null));
+renderDevilsAdvocateAudit({
+  agent: "devils_advocate",
+  status: "idle",
+  challenge:
+    "But what happens if the tip pool includes managers or back-of-house staff while tipped employees are paid below full minimum wage?",
+  resolution: "Upload a file and run the audit to produce a defensible payroll payload."
+});
+document.querySelector("#jsonOutput").textContent = JSON.stringify({ status: "awaiting_file_upload" }, null, 2);
